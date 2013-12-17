@@ -39,9 +39,46 @@ local function _each_socket(self, func)
     end)
 end
 
+local function _any(t, func)
+    for _,v in ipairs(t) do
+        if func(v) then return true end
+    end
+    return false
+end
+
+local function _count(t, func)
+    c = 0
+    for _,v in ipairs(t) do
+        if func(v) then c = c + 1 end
+    end
+    return c
+end
+
+local function _server_connected(server)
+    if server.retry_time > 0 or not server.sock then return false end
+    return true
+end
+
+local function _handle_server_error(self, server, err)
+    if self.verbose then
+        print(string.format("error on %s:%d %s", server.host, server.port, tostring(err)))
+    end
+    server.retry_time = ngx.time() + self.retry_delay
+end
+
+local function _create_server(host, port, opts)
+    local server = {}
+    server.host = host
+    server.port = port
+    server.opts = opts or {}
+    server.retry_time = 0
+    return server
+end
+
 function _M.new(self, opts)
     local escape_key = escape_uri
     local unescape_key = unescape_uri
+    local verbose = false
 
     if opts then
        local key_transform = opts.key_transform
@@ -53,12 +90,18 @@ function _M.new(self, opts)
              return nil, "expecting key_transform = { escape, unescape } table"
           end
        end
+
+       if opts.verbose then
+           verbose = opts.verbose
+       end
     end
 
     return setmetatable({
         servers = {},
         escape_key = escape_key,
         unescape_key = unescape_key,
+        retry_delay = 30, -- seconds
+        verbose = verbose
     }, mt)
 end
 
@@ -79,16 +122,15 @@ end
 function _M.connect(self, ...)
     local arg = {...}
     if type(arg[1]) == "table" then
+        for _, s in ipairs(arg[1]) do
+            table.insert(self.servers, _create_server(s.host, s.port, s.opts))
+        end
     else
-        local server = {}
-        server.host = arg[1]
-        server.port = arg[2]
-        server.opts = arg[3] or {}
-        self.servers[1] = server
+        table.insert(self.servers, _create_server(arg[1], arg[2], arg[3]))
     end
 
     local err = _each_server(self, function(server)
-        local err
+        local ok, err
         server.sock = tcp()
         if not server.sock then
             return nil, err
@@ -96,8 +138,17 @@ function _M.connect(self, ...)
 
         if self.timeout then _M.set_timeout(self, self.timeout) end
 
-        return server.sock:connect(server.host, server.port, server.opts)
+        ok, err = server.sock:connect(server.host, server.port, server.opts)
+        if not ok then
+            _handle_server_error(self, server, err)
+        end
+        return ok, err
     end)
+
+    -- return true so long as we're connected to one server
+    if err and _any(self.servers, _server_connected) then
+        return 1, nil
+    end
 
     return (not err and 1 or nil), err
 end
