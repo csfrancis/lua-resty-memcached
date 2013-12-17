@@ -20,13 +20,26 @@ local _M = {
 
 local mt = { __index = _M }
 
+local function _get_sock(self, key)
+    return self.servers[1].sock
+end
+
+local function _each_server(self, func)
+    local last_err
+    for _,server in ipairs(self.servers) do
+        local _, err = func(server)
+        if err then last_err = err end
+    end
+    return last_err
+end
+
+local function _each_socket(self, func)
+    return _each_server(self, function(server)
+        return func(server.sock)
+    end)
+end
 
 function _M.new(self, opts)
-    local sock, err = tcp()
-    if not sock then
-        return nil, err
-    end
-
     local escape_key = escape_uri
     local unescape_key = unescape_uri
 
@@ -43,7 +56,7 @@ function _M.new(self, opts)
     end
 
     return setmetatable({
-        sock = sock,
+        servers = {},
         escape_key = escape_key,
         unescape_key = unescape_key,
     }, mt)
@@ -51,27 +64,47 @@ end
 
 
 function _M.set_timeout(self, timeout)
-    local sock = self.sock
-    if not sock then
-        return nil, "not initialized"
+    if #self.servers == 0 then
+        self.timeout = timeout
+    else
+        _each_socket(self, function(sock)
+            if sock then
+                sock:settimeout(timeout)
+            end
+        end)
     end
-
-    return sock:settimeout(timeout)
 end
 
 
 function _M.connect(self, ...)
-    local sock = self.sock
-    if not sock then
-        return nil, "not initialized"
+    local arg = {...}
+    if type(arg[1]) == "table" then
+    else
+        local server = {}
+        server.host = arg[1]
+        server.port = arg[2]
+        server.opts = arg[3] or {}
+        self.servers[1] = server
     end
 
-    return sock:connect(...)
+    local err = _each_server(self, function(server)
+        local err
+        server.sock = tcp()
+        if not server.sock then
+            return nil, err
+        end
+
+        if self.timeout then _M.set_timeout(self, self.timeout) end
+
+        return server.sock:connect(server.host, server.port, server.opts)
+    end)
+
+    return (not err and 1 or nil), err
 end
 
 
 local function _multi_get(self, keys)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -141,7 +174,7 @@ function _M.get(self, key)
         return _multi_get(self, key)
     end
 
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, nil, "not initialized"
     end
@@ -187,7 +220,7 @@ end
 
 
 local function _multi_gets(self, keys)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -258,7 +291,7 @@ function _M.gets(self, key)
         return _multi_gets(self, key)
     end
 
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, nil, nil, "not initialized"
     end
@@ -329,7 +362,7 @@ local function _store(self, cmd, key, value, exptime, flags)
         flags = 0
     end
 
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -393,7 +426,7 @@ function _M.cas(self, key, value, cas_uniq, exptime, flags)
         flags = 0
     end
 
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -426,7 +459,7 @@ end
 
 
 function _M.delete(self, key)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -454,7 +487,7 @@ end
 
 
 function _M.set_keepalive(self, ...)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -464,7 +497,7 @@ end
 
 
 function _M.get_reused_times(self)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -474,7 +507,7 @@ end
 
 
 function _M.flush_all(self, time)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -505,7 +538,7 @@ end
 
 
 local function _incr_decr(self, cmd, key, value)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -541,7 +574,7 @@ end
 
 
 function _M.stats(self, args)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -584,7 +617,7 @@ end
 
 
 function _M.version(self)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -609,7 +642,7 @@ end
 
 
 function _M.quit(self)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -624,7 +657,7 @@ end
 
 
 function _M.verbosity(self, level)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -648,7 +681,7 @@ end
 
 
 function _M.touch(self, key, exptime)
-    local sock = self.sock
+    local sock = _get_sock(self)
     if not sock then
         return nil, "not initialized"
     end
@@ -673,12 +706,13 @@ end
 
 
 function _M.close(self)
-    local sock = self.sock
-    if not sock then
-        return nil, "not initialized"
-    end
-
-    return sock:close()
+    local err = _each_socket(self, function(sock)
+        if not sock then
+            return nil, "not initialized"
+        end
+        return sock:close()
+    end)
+    return (not err and 1 or nil), err
 end
 
 
