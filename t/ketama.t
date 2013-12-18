@@ -3,7 +3,7 @@
 use Test::Nginx::Socket::Lua;
 use Cwd qw(cwd);
 
-repeat_each(2);
+repeat_each(1);
 
 plan tests => repeat_each() * (3 * blocks());
 
@@ -93,3 +93,59 @@ lua tcp socket connect timed out
 failed to connect
 --- error_log
 Connection refused
+
+=== TEST 3: connect reuses continuum
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua '
+            local memcached = require "resty.memcached"
+            local memc = memcached:new({verbose = true})
+
+            memc:set_timeout(100) -- 100 msec
+
+            local ok, err = memc:connect({
+              {
+                host = "127.0.0.1",
+                port = 11211
+              },
+              {
+                host = "127.0.0.1",
+                port = 11212
+              }
+            })
+            if not ok then
+                ngx.say("failed to connect: ", err)
+                return
+            end
+
+            memc = memcached:new({verbose = true})
+
+            memc:set_timeout(100) -- 100 msec
+
+            local ok, err = memc:connect({
+              {
+                host = "127.0.0.1",
+                port = 11211
+              },
+              {
+                host = "127.0.0.1",
+                port = 11212
+              }
+            })
+            if not ok then
+                ngx.say("failed to connect: ", err)
+                return
+            end
+
+            ngx.say("connected")
+        ';
+    }
+--- request
+    GET /t
+--- response_body_like chomp
+connected
+--- grep_error_log chop
+2/2 live servers
+--- grep_error_log_out
+2/2 live servers

@@ -11,18 +11,23 @@ local concat = table.concat
 local setmetatable = setmetatable
 local type = type
 local error = error
-
+local bit, ffi
 
 local _M = {
     _VERSION = '0.12'
 }
 
+local _continuum = {}
+
+local MEMCACHED_DEFAULT_PORT = 11211
+local MEMCACHED_DEFAULT_RETRY_TIME = 30
+local MEMCACHED_DEFAULT_WEIGHT = 8
+local MEMCACHED_POINTS_PER_SERVER_KETAMA = 160
+
+local FNV_32_INIT = 2166136261
+local FNV_32_PRIME = 16777619
 
 local mt = { __index = _M }
-
-local function _get_sock(self, key)
-    return self.servers[1].sock
-end
 
 local function _each_server(self, func)
     local last_err
@@ -46,24 +51,28 @@ local function _any(t, func)
     return false
 end
 
-local function _count(t, func)
-    c = 0
-    for _,v in ipairs(t) do
-        if func(v) then c = c + 1 end
+local function _has_single_element(t)
+    local count = 0
+    for _ in pairs(t) do
+        count = count + 1
+        if count > 1 then return false end
     end
-    return c
+    return count == 1 or false
 end
 
 local function _server_connected(server)
-    if server.retry_time > 0 or not server.sock then return false end
+    if not server.sock then return false end
     return true
 end
 
-local function _handle_server_error(self, server, err)
+local function _handle_server_error(self, server, update_continuum, err)
     if self.verbose then
         print(string.format("error on %s:%d %s", server.host, server.port, tostring(err)))
     end
-    server.retry_time = ngx.time() + self.retry_delay
+    server.sock = nil
+    if update_continuum then
+        _update_continuum(self)
+    end
 end
 
 local function _create_server(host, port, opts)
@@ -71,8 +80,163 @@ local function _create_server(host, port, opts)
     server.host = host
     server.port = port
     server.opts = opts or {}
-    server.retry_time = 0
+    server.opts.weight = server.opts.weight or MEMCACHED_DEFAULT_WEIGHT
     return server
+end
+
+local function _connect_server(self, server)
+    local ok, err
+    server.sock = tcp()
+    if not server.sock then
+        return nil, err
+    end
+
+    if self.timeout then _M.set_timeout(self, self.timeout) end
+
+    ok, err = server.sock:connect(server.host, server.port, server.opts)
+    if not ok then
+        _handle_server_error(self, server, false, err)
+    end
+    return ok, err
+end
+
+local function _fnv1_32(key)
+    local hash = FNV_32_INIT
+    for i=1, key:len() do
+        hash = tonumber(ffi.cast('uint32_t', ffi.cast('uint32_t', hash) * ffi.cast('uint32_t', FNV_32_PRIME)))
+        hash = bit.bxor(hash, key:byte(i))
+    end
+    return hash
+end
+
+local function _hash_key(key)
+    return _fnv1_32(key)
+end
+
+local function _find_server_index(continuum, hash)
+    local first, last, middle = 1
+    local left = first
+    local right = last
+
+    while left < right do
+        middle = math.floor(left + (right - left) / 2)
+        if continuum[middle].value < hash then
+            left = middle + 1
+        else
+            right = middle
+        end
+    end
+
+    if right == last then
+        right = first
+    end
+
+    return continuum[right].server_index
+end
+
+local function _add_server_to_continuum(continuum, server, server_index, total_weight, live_servers)
+    local pct = server.opts.weight / total_weight
+    local pointer_per_server = (math.floor(pct * MEMCACHED_POINTS_PER_SERVER_KETAMA / 4 * live_servers + 0.0000000001) * 4)
+    local pointer_per_hash = 4
+
+    for pointer_index = 1, pointer_per_server / pointer_per_hash do
+        local sort_host
+        if server.port == MEMCACHED_DEFAULT_PORT then
+            sort_host = string.format("%s-%d", server.host, pointer_index - 1)
+        else
+            sort_host = string.format("%s:%d-%d", server.host, server.port, pointer_index - 1)
+        end
+
+        local result = ngx.md5_bin(sort_host)
+        for i=1, pointer_per_hash do
+            local alignment = i - 1
+            local value = bit.bor(bit.lshift(bit.band(result:byte(4 + alignment * 4), 0xff), 24),
+                bit.lshift(bit.band(result:byte(3 + alignment * 4), 0xff), 16),
+                bit.lshift(bit.band(result:byte(2 + alignment * 4), 0xff), 8),
+                bit.band(result:byte(1 + alignment * 4), 0xff))
+            entry = {}
+            entry.server_index = server_index
+            entry.value = value
+            table.insert(continuum, entry)
+        end
+    end
+end
+
+local function _get_continuum_hash(self, pred)
+    local t = {}
+    _each_server(self, function(server)
+        if not pred or pred(server) then
+            table.insert(t, server.host)
+            table.insert(t, server.port)
+            table.insert(t, server.weight)
+        end
+    end)
+    return ngx.md5(table.concat(t, ","))
+end
+
+local function _get_live_server_continuum_hash(self)
+    return _get_continuum_hash(self, function(server) return server.sock end)
+end
+
+local function _build_continuum(self)
+    local total_weight = 0
+    local live_servers = 0
+    local continuum = {}
+    for _,server in ipairs(self.servers) do
+        if _server_connected(server) then
+            live_servers = live_servers + 1
+            total_weight = total_weight + server.opts.weight
+        end
+    end
+
+    for idx,server in ipairs(self.servers) do
+        if _server_connected(server) then
+            _add_server_to_continuum(continuum, server, idx, total_weight, live_servers)
+        end
+    end
+
+    table.sort(continuum, function(a, b) return a.value < b.value end)
+
+    if self.verbose then
+        print(string.format("built continuum with %d entries for %d/%d live servers",
+            #continuum, live_servers, #self.servers))
+    end
+
+    return continuum
+end
+
+local function _update_continuum(self)
+    local c = _continuum[self.continuum_hash]
+    if not c then
+        c = {
+            rebuilding = false,
+            build_time = 0
+        }
+        _continuum[self.continuum_hash] = c
+    end
+
+    if c.rebuilding or c.build_time > self.connect_time then
+        return
+    end
+
+    c.rebuilding = true
+    c.data = _build_continuum(self)
+    c.hash = _get_live_server_continuum_hash(self)
+    c.build_time = ngx.now()
+    c.rebuilding = false
+
+    return c.data
+end
+
+local function _get_sock(self, key)
+    if #self.servers == 1 then
+        return self.servers[1].sock
+    elseif #self.servers > 1 then
+        idx = _find_server_index(self.continuum, _hash_key(key))
+        return self.servers[idx] and self.servers[idx].sock or nil
+    else
+        return nil
+    end
 end
 
 function _M.new(self, opts)
@@ -98,18 +262,17 @@ function _M.new(self, opts)
 
     return setmetatable({
         servers = {},
+        connect_time = ngx.now(),
         escape_key = escape_key,
         unescape_key = unescape_key,
-        retry_delay = 30, -- seconds
         verbose = verbose
     }, mt)
 end
 
 
 function _M.set_timeout(self, timeout)
-    if #self.servers == 0 then
-        self.timeout = timeout
-    else
+    self.timeout = timeout
+    if #self.servers > 0 then
         _each_socket(self, function(sock)
             if sock then
                 sock:settimeout(timeout)
@@ -121,29 +284,33 @@ end
 
 function _M.connect(self, ...)
     local arg = {...}
+
+    for i in ipairs(self.servers) do self.servers[i] = nil end
+
     if type(arg[1]) == "table" then
+        if not bit then
+            bit = require("bit")
+            ffi = require("ffi")
+        end
         for _, s in ipairs(arg[1]) do
             table.insert(self.servers, _create_server(s.host, s.port, s.opts))
         end
     else
-        table.insert(self.servers, _create_server(arg[1], arg[2], arg[3]))
+        table.insert(self.servers, _create_server(unpack(arg)))
     end
 
     local err = _each_server(self, function(server)
-        local ok, err
-        server.sock = tcp()
-        if not server.sock then
-            return nil, err
-        end
-
-        if self.timeout then _M.set_timeout(self, self.timeout) end
-
-        ok, err = server.sock:connect(server.host, server.port, server.opts)
-        if not ok then
-            _handle_server_error(self, server, err)
-        end
-        return ok, err
+        return _connect_server(self, server)
     end)
+
+    if #self.servers > 1 then
+        self.continuum_hash = _get_continuum_hash(self)
+        local c = _continuum[self.continuum_hash]
+        self.continuum = c and c.data or nil
+        if not c or c.hash ~= _get_live_server_continuum_hash(self) then
+            self.continuum = _update_continuum(self)
+        end
+    end
 
     -- return true so long as we're connected to one server
     if err and _any(self.servers, _server_connected) then
@@ -538,22 +705,30 @@ end
 
 
 function _M.set_keepalive(self, ...)
-    local sock = _get_sock(self)
-    if not sock then
-        return nil, "not initialized"
-    end
-
-    return sock:setkeepalive(...)
+    arg = {...}
+    local err = _each_socket(self, function(sock)
+        if not sock then
+            return nil, "not initialized"
+        end
+        return sock:setkeepalive(unpack(arg))
+    end)
+    return (not err and 1 or nil), err
 end
 
 
 function _M.get_reused_times(self)
-    local sock = _get_sock(self)
-    if not sock then
-        return nil, "not initialized"
-    end
+    count = 0
+    local err = _each_socket(self, function(sock)
+        local sock = _get_sock(self)
+        if not sock then
+            return nil, "not initialized"
+        end
 
-    return sock:getreusedtimes()
+        local c, err = sock:getreusedtimes()
+        count = count + (c and c or 0)
+        return count, err
+    end)
+    return (not err and count or nil), err
 end
 
 
