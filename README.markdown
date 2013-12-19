@@ -13,6 +13,7 @@ Table of Contents
 * [Methods](#methods)
     * [new](#new)
     * [connect](#connect)
+    * [is_connected](#is_connected)
     * [set](#set)
     * [set_timeout](#set_timeout)
     * [set_keepalive](#set_keepalive)
@@ -35,6 +36,7 @@ Table of Contents
     * [quit](#quit)
     * [verbosity](#verbosity)
 * [Automatic Error Logging](#automatic-error-logging)
+* [Consistent Hashing](#consistent-hashing)
 * [Limitations](#limitations)
 * [TODO](#todo)
 * [Author](#author)
@@ -167,9 +169,23 @@ connect
 
 `syntax: ok, err = memc:connect("unix:/path/to/unix.sock")`
 
+`syntax: results = memc:connect({ {host1, port1, opts?}, ... })`
+
 Attempts to connect to the remote host and port that the memcached server is listening to or a local unix domain socket file listened by the memcached server.
 
+Multiple servers can be used by passing a table. This will enable [consistent hashing](#consistent-hashing). An optional `opts` table can be provided for each server that allows the following keys to be set:
+
+- `weight` Sets the weight of the connection. Default value is 8.
+
 Before actually resolving the host name and connecting to the remote backend, this method will always look up the connection pool for matched idle connections created by previous calls of this method.
+
+[Back to TOC](#table-of-contents)
+
+is_connected
+------------
+`syntax: connected = memc:is_connected()`
+
+Determines if there is an established connection to any memcached servers. When using multiple servers this will return true if at least one memcached server is available, otherwise false.
 
 [Back to TOC](#table-of-contents)
 
@@ -512,6 +528,17 @@ handling in your own Lua code, then you are recommended to disable this automati
 
 [Back to TOC](#table-of-contents)
 
+Consistent Hashing
+==================
+
+The library implements [consistent hashing](http://en.wikipedia.org/wiki/Consistent_hashing) using the ketama algorithm. If a table of servers is passed to [connect](#connect) consistent hashing will be automatically enabled. The implementation has been written to be compatible with [libmemcached](http://libmemcached.org/libMemcached.html).
+
+There is a single continuum per worker. The continuum will be automatically updated whenever a server's availability changes. Because an nginx worker is single-threaded the continuum can be updated without requiring any thread locking primitives.
+
+The biggest change to the API is that any methods that do not operate on a key will be applied to all servers (for example, [flush_all](#flush_all), [stats](#stats)). When a client is using multiple servers the result from these APIs will be an array containing the result from each server. When using a single server, values will be returned as before.
+
+[Back to TOC](#table-of-contents)
+
 Limitations
 ===========
 
@@ -536,10 +563,11 @@ TODO
 
 [Back to TOC](#table-of-contents)
 
-Author
-======
+Authors
+=======
 
 Yichun "agentzh" Zhang (章亦春) <agentzh@gmail.com>, CloudFlare Inc.
+Scott Francis (scott.francis@shopify.com), Shopify.
 
 [Back to TOC](#table-of-contents)
 
