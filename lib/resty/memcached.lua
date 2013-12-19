@@ -29,13 +29,21 @@ local FNV_32_PRIME = 16777619
 
 local mt = { __index = _M }
 
-local function _each_server(self, func)
-    local last_err
-    for _,server in ipairs(self.servers) do
-        local _, err = func(server)
-        if err then last_err = err end
+local function _return_result(self, result)
+    if #self.servers == 1 then
+        return result[1][1], result[1][2]
+    else
+        return result
     end
-    return last_err
+end
+
+local function _each_server(self, func)
+    local result = {}
+    for _,server in ipairs(self.servers) do
+        local ok, err = func(server)
+        table.insert(result, {ok, err})
+    end
+    return result
 end
 
 local function _each_socket(self, func)
@@ -67,7 +75,8 @@ end
 
 local function _handle_server_error(self, server, update_continuum, err)
     if self.verbose then
-        print(string.format("error on %s:%d %s", server.host, server.port, tostring(err)))
+        print(string.format("error on %s:%d %s", server.host, server.port,
+            tostring(err)))
     end
     server.sock = nil
     if update_continuum then
@@ -103,7 +112,8 @@ end
 local function _fnv1_32(key)
     local hash = FNV_32_INIT
     for i=1, key:len() do
-        hash = tonumber(ffi.cast('uint32_t', ffi.cast('uint32_t', hash) * ffi.cast('uint32_t', FNV_32_PRIME)))
+        hash = tonumber(ffi.cast('uint32_t',
+            ffi.cast('uint32_t', hash) * ffi.cast('uint32_t', FNV_32_PRIME)))
         hash = bit.bxor(hash, key:byte(i))
     end
     return hash
@@ -114,7 +124,7 @@ local function _hash_key(key)
 end
 
 local function _find_server_index(continuum, hash)
-    local first, last, middle = 1
+    local first, last, middle = 1, (#continuum + 1)
     local left = first
     local right = last
 
@@ -134,9 +144,13 @@ local function _find_server_index(continuum, hash)
     return continuum[right].server_index
 end
 
-local function _add_server_to_continuum(continuum, server, server_index, total_weight, live_servers)
+local function _add_server_to_continuum(continuum, server,
+                                        server_index,
+                                        total_weight, live_servers)
     local pct = server.opts.weight / total_weight
-    local pointer_per_server = (math.floor(pct * MEMCACHED_POINTS_PER_SERVER_KETAMA / 4 * live_servers + 0.0000000001) * 4)
+    local pointer_per_server = (math.floor(pct
+        * MEMCACHED_POINTS_PER_SERVER_KETAMA / 4 * live_servers + 0.0000000001)
+        * 4)
     local pointer_per_hash = 4
 
     for pointer_index = 1, pointer_per_server / pointer_per_hash do
@@ -144,13 +158,15 @@ local function _add_server_to_continuum(continuum, server, server_index, total_w
         if server.port == MEMCACHED_DEFAULT_PORT then
             sort_host = string.format("%s-%d", server.host, pointer_index - 1)
         else
-            sort_host = string.format("%s:%d-%d", server.host, server.port, pointer_index - 1)
+            sort_host = string.format("%s:%d-%d", server.host, server.port,
+                pointer_index - 1)
         end
 
         local result = ngx.md5_bin(sort_host)
         for i=1, pointer_per_hash do
             local alignment = i - 1
-            local value = bit.bor(bit.lshift(bit.band(result:byte(4 + alignment * 4), 0xff), 24),
+            local value = bit.bor(
+                bit.lshift(bit.band(result:byte(4 + alignment * 4), 0xff), 24),
                 bit.lshift(bit.band(result:byte(3 + alignment * 4), 0xff), 16),
                 bit.lshift(bit.band(result:byte(2 + alignment * 4), 0xff), 8),
                 bit.band(result:byte(1 + alignment * 4), 0xff))
@@ -171,11 +187,11 @@ local function _get_continuum_hash(self, pred)
             table.insert(t, server.weight)
         end
     end)
-    return ngx.md5(table.concat(t, ","))
+    return ngx.md5(concat(t, ","))
 end
 
 local function _get_live_server_continuum_hash(self)
-    return _get_continuum_hash(self, function(server) return server.sock end)
+    return _get_continuum_hash(self, _server_connected)
 end
 
 local function _build_continuum(self)
@@ -191,14 +207,16 @@ local function _build_continuum(self)
 
     for idx,server in ipairs(self.servers) do
         if _server_connected(server) then
-            _add_server_to_continuum(continuum, server, idx, total_weight, live_servers)
+            _add_server_to_continuum(continuum, server, idx, total_weight,
+                live_servers)
         end
     end
 
     table.sort(continuum, function(a, b) return a.value < b.value end)
 
     if self.verbose then
-        print(string.format("built continuum with %d entries for %d/%d live servers",
+        print(string.format(
+            "built continuum with %d entries for %d/%d live servers",
             #continuum, live_servers, #self.servers))
     end
 
@@ -232,11 +250,45 @@ local function _get_sock(self, key)
     if #self.servers == 1 then
         return self.servers[1].sock
     elseif #self.servers > 1 then
-        idx = _find_server_index(self.continuum, _hash_key(key))
+        hash = _hash_key(key)
+        idx = _find_server_index(self.continuum, hash)
+        if self.debug then
+            print(string.format("key '%s' (%s) maps to server %s:%d (%d)",
+                key, bit.tohex(hash), self.servers[idx].host,
+                self.servers[idx].port, idx))
+        end
         return self.servers[idx] and self.servers[idx].sock or nil
     else
         return nil
     end
+end
+
+local function _each_socket_with_keys(self, keys, func)
+    if #self.servers == 1 then
+        return func(self.servers[1].sock, keys)
+    end
+
+    -- group keys by server
+    local keys_by_server = {}
+    for _,key in ipairs(keys) do
+        local idx = _find_server_index(self.continuum, _hash_key(key))
+        if keys_by_server[idx] == nil then
+            keys_by_server[idx] = {}
+        end
+        table.insert(keys_by_server[idx], key)
+    end
+
+    local results = {}
+    for k,v in pairs(keys_by_server) do
+        local r, err = func(self.servers[k].sock, v)
+        if not err and r then
+            for k1,v1 in pairs(r) do
+                results[k1] = v1
+            end
+        end
+    end
+
+    return results
 end
 
 function _M.new(self, opts)
@@ -299,7 +351,7 @@ function _M.connect(self, ...)
         table.insert(self.servers, _create_server(unpack(arg)))
     end
 
-    local err = _each_server(self, function(server)
+    local result = _each_server(self, function(server)
         return _connect_server(self, server)
     end)
 
@@ -312,78 +364,83 @@ function _M.connect(self, ...)
         end
     end
 
-    -- return true so long as we're connected to one server
-    if err and _any(self.servers, _server_connected) then
-        return 1, nil
-    end
-
-    return (not err and 1 or nil), err
+    return _return_result(self, result)
 end
 
+function _M.is_connected(self)
+    local connected = false
+    _each_server(self, function(server)
+        if _server_connected(server) then
+            connected = true
+        end
+    end)
+    return connected
+end
 
 local function _multi_get(self, keys)
-    local sock = _get_sock(self)
-    if not sock then
-        return nil, "not initialized"
-    end
+    return _each_socket_with_keys(self, keys, function(sock, keys)
+        if not sock then
+            return nil, "not initialized"
+        end
 
-    local nkeys = #keys
+        local nkeys = #keys
 
-    if nkeys == 0 then
-        return {}, nil
-    end
+        if nkeys == 0 then
+            return {}, nil
+        end
 
-    local escape_key = self.escape_key
-    local cmd = {"get"}
-    local n = 1
+        local escape_key = self.escape_key
+        local cmd = {"get"}
+        local n = 1
 
-    for i = 1, nkeys do
-        cmd[n + 1] = " "
-        cmd[n + 2] = escape_key(keys[i])
-        n = n + 2
-    end
-    cmd[n + 1] = "\r\n"
+        for i = 1, nkeys do
+            cmd[n + 1] = " "
+            cmd[n + 2] = escape_key(keys[i])
+            n = n + 2
+        end
+        cmd[n + 1] = "\r\n"
 
-    -- print("multi get cmd: ", cmd)
+        -- print("multi get cmd: ", cmd)
 
-    local bytes, err = sock:send(concat(cmd))
-    if not bytes then
-        return nil, err
-    end
-
-    local unescape_key = self.unescape_key
-    local results = {}
-
-    while true do
-        local line, err = sock:receive()
-        if not line then
+        local bytes, err = sock:send(concat(cmd))
+        if not bytes then
             return nil, err
         end
 
-        if line == 'END' then
-            break
-        end
+        local unescape_key = self.unescape_key
+        local results = {}
 
-        local key, flags, len = match(line, '^VALUE (%S+) (%d+) (%d+)$')
-        -- print("key: ", key, "len: ", len, ", flags: ", flags)
-
-        if key then
-
-            local data, err = sock:receive(len)
-            if not data then
+        while true do
+            local line, err = sock:receive()
+            if not line then
                 return nil, err
             end
 
-            results[unescape_key(key)] = {data, flags}
+            if line == 'END' then
+                break
+            end
 
-            data, err = sock:receive(2) -- discard the trailing CRLF
-            if not data then
-                return nil, err
+            local key, flags, len = match(line, '^VALUE (%S+) (%d+) (%d+)$')
+            -- print("key: ", key, "len: ", len, ", flags: ", flags)
+
+            if key then
+
+                local data, err = sock:receive(len)
+                if not data then
+                    return nil, err
+                end
+
+                results[unescape_key(key)] = {data, flags}
+
+                data, err = sock:receive(2) -- discard the trailing CRLF
+                if not data then
+                    return nil, err
+                end
             end
         end
-    end
 
-    return results
+        return results
+    end)
 end
 
 
@@ -392,7 +449,7 @@ function _M.get(self, key)
         return _multi_get(self, key)
     end
 
-    local sock = _get_sock(self)
+    local sock = _get_sock(self, key)
     if not sock then
         return nil, nil, "not initialized"
     end
@@ -438,69 +495,70 @@ end
 
 
 local function _multi_gets(self, keys)
-    local sock = _get_sock(self)
-    if not sock then
-        return nil, "not initialized"
-    end
+    return _each_socket_with_keys(self, keys, function(sock, keys)
+        if not sock then
+            return nil, "not initialized"
+        end
 
-    local nkeys = #keys
+        local nkeys = #keys
 
-    if nkeys == 0 then
-        return {}, nil
-    end
+        if nkeys == 0 then
+            return {}, nil
+        end
 
-    local escape_key = self.escape_key
-    local cmd = {"gets"}
-    local n = 1
-    for i = 1, nkeys do
-        cmd[n + 1] = " "
-        cmd[n + 2] = escape_key(keys[i])
-        n = n + 2
-    end
-    cmd[n + 1] = "\r\n"
+        local escape_key = self.escape_key
+        local cmd = {"gets"}
+        local n = 1
+        for i = 1, nkeys do
+            cmd[n + 1] = " "
+            cmd[n + 2] = escape_key(keys[i])
+            n = n + 2
+        end
+        cmd[n + 1] = "\r\n"
 
-    -- print("multi get cmd: ", cmd)
+        -- print("multi get cmd: ", cmd)
 
-    local bytes, err = sock:send(concat(cmd))
-    if not bytes then
-        return nil, err
-    end
-
-    local unescape_key = self.unescape_key
-    local results = {}
-
-    while true do
-        local line, err = sock:receive()
-        if not line then
+        local bytes, err = sock:send(concat(cmd))
+        if not bytes then
             return nil, err
         end
 
-        if line == 'END' then
-            break
-        end
+        local unescape_key = self.unescape_key
+        local results = {}
 
-        local key, flags, len, cas_uniq =
-                match(line, '^VALUE (%S+) (%d+) (%d+) (%d+)$')
-
-        -- print("key: ", key, "len: ", len, ", flags: ", flags)
-
-        if key then
-
-            local data, err = sock:receive(len)
-            if not data then
+        while true do
+            local line, err = sock:receive()
+            if not line then
                 return nil, err
             end
 
-            results[unescape_key(key)] = {data, flags, cas_uniq}
+            if line == 'END' then
+                break
+            end
 
-            data, err = sock:receive(2) -- discard the trailing CRLF
-            if not data then
-                return nil, err
+            local key, flags, len, cas_uniq =
+                    match(line, '^VALUE (%S+) (%d+) (%d+) (%d+)$')
+
+            -- print("key: ", key, "len: ", len, ", flags: ", flags)
+
+            if key then
+
+                local data, err = sock:receive(len)
+                if not data then
+                    return nil, err
+                end
+
+                results[unescape_key(key)] = {data, flags, cas_uniq}
+
+                data, err = sock:receive(2) -- discard the trailing CRLF
+                if not data then
+                    return nil, err
+                end
             end
         end
-    end
 
-    return results
+        return results
+    end)
 end
 
 
@@ -509,7 +567,7 @@ function _M.gets(self, key)
         return _multi_gets(self, key)
     end
 
-    local sock = _get_sock(self)
+    local sock = _get_sock(self, key)
     if not sock then
         return nil, nil, nil, "not initialized"
     end
@@ -580,7 +638,7 @@ local function _store(self, cmd, key, value, exptime, flags)
         flags = 0
     end
 
-    local sock = _get_sock(self)
+    local sock = _get_sock(self, key)
     if not sock then
         return nil, "not initialized"
     end
@@ -644,7 +702,7 @@ function _M.cas(self, key, value, cas_uniq, exptime, flags)
         flags = 0
     end
 
-    local sock = _get_sock(self)
+    local sock = _get_sock(self, key)
     if not sock then
         return nil, "not initialized"
     end
@@ -677,7 +735,7 @@ end
 
 
 function _M.delete(self, key)
-    local sock = _get_sock(self)
+    local sock = _get_sock(self, key)
     if not sock then
         return nil, "not initialized"
     end
@@ -703,68 +761,66 @@ function _M.delete(self, key)
     return 1
 end
 
-
 function _M.set_keepalive(self, ...)
-    arg = {...}
-    local err = _each_socket(self, function(sock)
+    local arg = {...}
+    local result = _each_socket(self, function(sock)
         if not sock then
             return nil, "not initialized"
         end
         return sock:setkeepalive(unpack(arg))
     end)
-    return (not err and 1 or nil), err
+    return _return_result(self, result)
 end
 
 
 function _M.get_reused_times(self)
-    count = 0
-    local err = _each_socket(self, function(sock)
+    local result = _each_socket(self, function(sock)
         local sock = _get_sock(self)
         if not sock then
             return nil, "not initialized"
         end
 
-        local c, err = sock:getreusedtimes()
-        count = count + (c and c or 0)
-        return count, err
+        return sock:getreusedtimes()
     end)
-    return (not err and count or nil), err
+    return _return_result(self, result)
 end
 
 
 function _M.flush_all(self, time)
-    local sock = _get_sock(self)
-    if not sock then
-        return nil, "not initialized"
-    end
+    local result = _each_socket(self, function(sock)
+        if not sock then
+            return nil, "not initialized"
+        end
 
-    local req
-    if time then
-        req = "flush_all " .. time .. "\r\n"
-    else
-        req = "flush_all\r\n"
-    end
+        local req
+        if time then
+            req = "flush_all " .. time .. "\r\n"
+        else
+            req = "flush_all\r\n"
+        end
 
-    local bytes, err = sock:send(req)
-    if not bytes then
-        return nil, err
-    end
+        local bytes, err = sock:send(req)
+        if not bytes then
+            return nil, err
+        end
 
-    local res, err = sock:receive()
-    if not res then
-        return nil, err
-    end
+        local res, err = sock:receive()
+        if not res then
+            return nil, err
+        end
 
-    if res ~= 'OK' then
-        return nil, res
-    end
+        if res ~= 'OK' then
+            return nil, res
+        end
 
-    return 1
+        return 1
+    end)
+    return _return_result(self, result)
 end
 
 
 local function _incr_decr(self, cmd, key, value)
-    local sock = _get_sock(self)
+    local sock = _get_sock(self, key)
     if not sock then
         return nil, "not initialized"
     end
@@ -800,114 +856,121 @@ end
 
 
 function _M.stats(self, args)
-    local sock = _get_sock(self)
-    if not sock then
-        return nil, "not initialized"
-    end
+    local result = _each_socket(self, function(sock)
+        if not sock then
+            return nil, "not initialized"
+        end
 
-    local req
-    if args then
-        req = "stats " .. args .. "\r\n"
-    else
-        req = "stats\r\n"
-    end
+        local req
+        if args then
+            req = "stats " .. args .. "\r\n"
+        else
+            req = "stats\r\n"
+        end
 
-    local bytes, err = sock:send(req)
-    if not bytes then
-        return nil, err
-    end
+        local bytes, err = sock:send(req)
+        if not bytes then
+            return nil, err
+        end
 
-    local lines = {}
-    local n = 0
-    while true do
+        local lines = {}
+        local n = 0
+        while true do
+            local line, err = sock:receive()
+            if not line then
+                return nil, err
+            end
+
+            if line == 'END' then
+                return lines, nil
+            end
+
+            if not match(line, "ERROR") then
+                n = n + 1
+                lines[n] = line
+            else
+                return nil, line
+            end
+        end
+        -- cannot reach here...
+        return lines
+    end)
+    return _return_result(self, result)
+end
+
+
+function _M.version(self)
+    local result = _each_socket(self, function(sock)
+        if not sock then
+            return nil, "not initialized"
+        end
+
+        local bytes, err = sock:send("version\r\n")
+        if not bytes then
+            return nil, err
+        end
+
         local line, err = sock:receive()
         if not line then
             return nil, err
         end
 
-        if line == 'END' then
-            return lines, nil
+        local ver = match(line, "^VERSION (.+)$")
+        if not ver then
+            return nil, ver
         end
 
-        if not match(line, "ERROR") then
-            n = n + 1
-            lines[n] = line
-        else
-            return nil, line
-        end
-    end
-
-    -- cannot reach here...
-    return lines
-end
-
-
-function _M.version(self)
-    local sock = _get_sock(self)
-    if not sock then
-        return nil, "not initialized"
-    end
-
-    local bytes, err = sock:send("version\r\n")
-    if not bytes then
-        return nil, err
-    end
-
-    local line, err = sock:receive()
-    if not line then
-        return nil, err
-    end
-
-    local ver = match(line, "^VERSION (.+)$")
-    if not ver then
-        return nil, ver
-    end
-
-    return ver
+        return ver
+    end)
+    return _return_result(self, result)
 end
 
 
 function _M.quit(self)
-    local sock = _get_sock(self)
-    if not sock then
-        return nil, "not initialized"
-    end
+    local result = _each_socket(self, function(sock)
+        if not sock then
+            return nil, "not initialized"
+        end
 
-    local bytes, err = sock:send("quit\r\n")
-    if not bytes then
-        return nil, err
-    end
+        local bytes, err = sock:send("quit\r\n")
+        if not bytes then
+            return nil, err
+        end
 
-    return 1
+        return 1
+    end)
+    return _return_result(self, result)
 end
 
 
 function _M.verbosity(self, level)
-    local sock = _get_sock(self)
-    if not sock then
-        return nil, "not initialized"
-    end
+    local result = _each_socket(self, function(sock)
+        if not sock then
+            return nil, "not initialized"
+        end
 
-    local bytes, err = sock:send("verbosity " .. level .. "\r\n")
-    if not bytes then
-        return nil, err
-    end
+        local bytes, err = sock:send("verbosity " .. level .. "\r\n")
+        if not bytes then
+            return nil, err
+        end
 
-    local line, err = sock:receive()
-    if not line then
-        return nil, err
-    end
+        local line, err = sock:receive()
+        if not line then
+            return nil, err
+        end
 
-    if line ~= 'OK' then
-        return nil, line
-    end
+        if line ~= 'OK' then
+            return nil, line
+        end
 
-    return 1
+        return 1
+    end)
+    return _return_result(self, result)
 end
 
 
 function _M.touch(self, key, exptime)
-    local sock = _get_sock(self)
+    local sock = _get_sock(self, key)
     if not sock then
         return nil, "not initialized"
     end
@@ -932,13 +995,13 @@ end
 
 
 function _M.close(self)
-    local err = _each_socket(self, function(sock)
+    local result = _each_socket(self, function(sock)
         if not sock then
             return nil, "not initialized"
         end
         return sock:close()
     end)
-    return (not err and 1 or nil), err
+    return _return_result(self, result)
 end
 
 
